@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'move_ar = ar_utils.move_ar:main',  # Entry point for your node
+            'move_ar2 = ar_utils.move_ar2:main',  # New entry point for your MoveIt Commander node
         ],
     },
 )

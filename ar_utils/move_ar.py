@@ -7,26 +7,42 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose 
+from geometry_msgs.msg import Point 
 # from moveit_commander.action import MoveGroupAction, MoveGroupGoal
 from moveit_msgs.action import MoveGroup
 import threading
 
 import tf2_ros
 from geometry_msgs.msg import PoseStamped
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose,Vector3
 #from tf2_geometry_msgs import do_transform_pose
 from pymoveit2 import MoveIt2
 import logging
 import debugpy
-
+import atexit
 import time
+
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Pose
+from moveit_msgs.action import MoveGroup
+from moveit_msgs.msg import MotionPlanRequest, Constraints, PositionConstraint, OrientationConstraint, WorkspaceParameters
+from shape_msgs.msg import SolidPrimitive
+from builtin_interfaces.msg import Duration
+from rclpy.action import ActionClient
+from std_msgs.msg import Header
+from trajectory_msgs.msg import JointTrajectory
+import threading
+
 
 #view end effector position
 #ros2 run tf2_ros tf2_echo base_link ee_link
 
+
+        
 class MoveAR(Node):
 
     def __init__(self):
@@ -49,7 +65,6 @@ class MoveAR(Node):
         self.file_logger.addHandler(file_handler)
 
         # Define callback group for service
-        #self.callback_group = MutuallyExclusiveCallbackGroup()
         self.callback_group = ReentrantCallbackGroup()
         # Create service that listens for Pose messages
         self.srv = self.create_service(
@@ -78,7 +93,7 @@ class MoveAR(Node):
             base_link_name="base_link",
             end_effector_name="link_6",
             group_name="ar_manipulator",
-            callback_group=self.callback_group
+            callback_group=ReentrantCallbackGroup()
         )
         self.moveit2.planner_id = "RRTConnectkConfigDefault"
         self.moveit2.max_velocity = 1.0
@@ -90,7 +105,7 @@ class MoveAR(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self._prev_marker_pose = None
         
-        # Timer: callback every 2.0 seconds
+        #Timer: callback every 2.0 seconds
         self.timer_callback_group = ReentrantCallbackGroup()
         self.timer = self.create_timer(2.0, self.timer_callback,callback_group=self.timer_callback_group)
 
@@ -125,7 +140,7 @@ class MoveAR(Node):
         print("")
         print("")
 
-        """Callback function for the 'ar_move_to' service."""
+        #Callback function for the 'ar_move_to' service.
         self.get_logger().info(f"Received move request: Position ({request.pose.position.x}, {request.pose.position.y}, {request.pose.position.z})")
         self.get_logger().info(f"Orientation: ({request.pose.orientation.x}, {request.pose.orientation.y}, {request.pose.orientation.z}, {request.pose.orientation.w})")
        
@@ -168,34 +183,50 @@ class MoveAR(Node):
         def _move_thread():
             self._move_in_progress = True
             self._move_done_event.clear()
-        
-            pose_goal = PoseStamped()
-            pose_goal.header.frame_id = "base_link"
-            pose_goal.pose = msg
-            print ("starting to move")
-            self.moveit2.move_to_pose(pose=pose_goal)
-            self.logger.info("Waiting1 for move to finish...")
-            ret = self.moveit2.wait_until_executed() 
+            try:
+                pose_goal = PoseStamped() 
+                pose_goal.header.frame_id = "base_link"
+                pose_goal.pose = msg
+                print ("starting to move")
+                self.moveit2.move_to_pose(pose=pose_goal)
+                self.logger.info("Waiting1 for move to finish...")
+                ret = self.moveit2.wait_until_executed() 
 
-            self.logger.info("Move finished")
-            self.logger.info(f"Move finished with result: {ret}")
-
-            self._move_in_progress = False
-            self._move_done_event.set()
+                self.logger.info("Move finished")
+                #self.logger.info(f"Move finished with result: {ret}") 
+                self.logger.info(f"Move finished with result") 
+            except Exception as e:
+                self.logger.error(f"Error during move: {e}")
+                #self.file_logger.error(f"Error during move: {e}")
+            finally:
+                self._move_in_progress = False
+                self._move_done_event.set()
+                self.logger.info("Move thread ended.")
 
         thread = threading.Thread(target=_move_thread, daemon=True)
         thread.start()
 
+
+
 def main():
 
-    # Allow attaching the debugger remotely on port 5678
-    # debugpy.listen(("0.0.0.0", 5678))
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
+    #Allow attaching the debugger remotely on port 5678
+    debugpy.listen(("0.0.0.0", 5678))
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
+    
+    
+    # atexit.register(lambda: print("⚠️  Shutdown triggered via atexit"))
+    # original_shutdown = rclpy.shutdown
+    # def my_shutdown(*args, **kwargs):
+    #     print("⚠️  rclpy.shutdown() was called!")
+    #     return original_shutdown(*args, **kwargs)
+    # rclpy.shutdown = my_shutdown
+
 
     rclpy.init()
     node = MoveAR()
-    executor = MultiThreadedExecutor(8) 
+    executor = MultiThreadedExecutor(30) 
     executor.add_node(node)
     try:
         executor.spin()
