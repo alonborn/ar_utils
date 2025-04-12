@@ -7,7 +7,7 @@ from rclpy.node import Node
 from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
 from geometry_msgs.msg import Point 
 from moveit_msgs.action import MoveGroup
-
+from tf2_ros import Buffer, TransformListener
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Pose,Vector3
 import debugpy
@@ -35,16 +35,58 @@ class MoveAR(Node):
             'ar_move_to_pose',  # Service name
             self.handle_move_ar,  # Callback function
             callback_group=self.callback_group
-        )
+        ) 
+        self.target_pose = Pose()
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
+        self.get_logger().info("\033[92mService 'ar_move_to' is ready to receive Pose messages.\033[0m")
 
         #Timer: callback every 2.0 seconds
-        self.timer_callback_group = ReentrantCallbackGroup()
-        self.timer = self.create_timer(2.0, self.timer_callback,callback_group=self.timer_callback_group)
+        # self.timer_callback_group = ReentrantCallbackGroup()
+        # self.timer = self.create_timer(2.0, self.timer_callback,callback_group=self.timer_callback_group)
 
     def timer_callback(self):
         self.get_logger().info('ROS loop is alive!')
 
+    def pose_difference(self,pose1: Pose, pose2: Pose):
+        # Position difference
+        dx = pose2.position.x - pose1.position.x
+        dy = pose2.position.y - pose1.position.y
+        dz = pose2.position.z - pose1.position.z
+ 
+        # Orientation difference (quaternion subtraction)
+        dq_x = pose2.orientation.x - pose1.orientation.x
+        dq_y = pose2.orientation.y - pose1.orientation.y
+        dq_z = pose2.orientation.z - pose1.orientation.z
+        dq_w = pose2.orientation.w - pose1.orientation.w
+
+        return {
+            'position_diff': {'x': dx, 'y': dy, 'z': dz},
+            'orientation_diff': {'x': dq_x, 'y': dq_y, 'z': dq_z, 'w': dq_w}
+        }
+
+    def get_current_ee_pose(self) -> Pose:
+        try:
+            now = rclpy.time.Time()
+            trans = self.tf_buffer.lookup_transform(
+                target_frame='base_link',
+                source_frame='ee_link',
+                time=now,
+                timeout=rclpy.duration.Duration(seconds=1.0)
+            )
+
+            pose = Pose()
+            pose.position = trans.transform.translation
+            pose.orientation = trans.transform.rotation
+            return pose
+
+        except Exception as e:
+            self.get_logger().warn(f"TF lookup failed: {e}")
+            return None
+
     def send_pose_goal(self, pose: Pose):
+        self.target_pose = pose
         self.get_logger().info(f"Received move request: Position ({pose.position.x}, {pose.position.y}, {pose.position.z})")
         if self._move_in_progress:
             self.get_logger().warn("Move already in progress")
@@ -54,7 +96,7 @@ class MoveAR(Node):
             try:
                 self._move_in_progress = True
                 self._move_done_event.clear()
-                self.get_logger().info("Waiting for action server...")
+                #self.get_logger().info("Waiting for action server...")
                 self._action_client.wait_for_server()
 
                 goal_msg = MoveGroup.Goal()
@@ -71,9 +113,9 @@ class MoveAR(Node):
                 # Create a position constraint
                 pos_constraint = PositionConstraint()
                 pos_constraint.header.frame_id = "base_link"
-                pos_constraint.link_name = "ee_link"  # Your end effector link
+                pos_constraint.link_name = "ee_link"  # Your end effector link 
                 pos_constraint.target_point_offset = Vector3()
-                pos_constraint.constraint_region.primitives.append(SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.01]))
+                pos_constraint.constraint_region.primitives.append(SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.005]))
                 primitive_pose = Pose()
                 primitive_pose.position = pose.position
                 pos_constraint.constraint_region.primitive_poses.append(primitive_pose)
@@ -133,15 +175,22 @@ class MoveAR(Node):
             self._move_done_event.set()
             return
 
-        self.get_logger().info("Goal accepted, waiting for result...")
+        #self.get_logger().info("Goal accepted, waiting for result...")
         get_result_future = goal_handle.get_result_async()
         get_result_future.add_done_callback(self._get_result_callback)
     
     def _get_result_callback(self, future):
-        try:
+        try: 
             result = future.result().result
             self.get_logger().info(f"Action completed with result: {result.error_code.val}")
-        except Exception as e:
+            current_pose = self.get_current_ee_pose()
+            
+            diff = self.pose_difference(current_pose, self.target_pose)
+            print({
+                'position_diff': {axis: f"{val:.2f}" for axis, val in diff['position_diff'].items()},
+                'orientation_diff': {axis: f"{val:.2f}" for axis, val in diff['orientation_diff'].items()}
+            })
+        except Exception as e: 
             self.get_logger().error(f"Failed to get result: {e}")
         finally:
             self._move_in_progress = False
@@ -149,8 +198,7 @@ class MoveAR(Node):
 
     def handle_move_ar(self, request: MoveToPose.Request, response:MoveToPose.Response):
         """Callback function for the 'ar_move_to' service."""
-        self.get_logger().info(f"Received move request: Position ({request.pose.position.x}, {request.pose.position.y}, {request.pose.position.z})")
-        self.get_logger().info(f"Orientation: ({request.pose.orientation.x}, {request.pose.orientation.y}, {request.pose.orientation.z}, {request.pose.orientation.w})")
+        self.get_logger().info(f"Received move request: Position ({request.pose.position}, Orientation {request.pose.orientation.z})")
         
         pose_to_move = request.pose
         
