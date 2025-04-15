@@ -229,14 +229,6 @@ def main():
     # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
     # print("debugger attached")
     
-    # atexit.register(lambda: print("⚠️  Shutdown triggered via atexit"))
-    # original_shutdown = rclpy.shutdown
-    # def my_shutdown(*args, **kwargs):
-    #     print("⚠️  rclpy.shutdown() was called!")
-    #     return original_shutdown(*args, **kwargs)
-    # rclpy.shutdown = my_shutdown
- 
-
     rclpy.init()
     node = MoveAR()
     executor = MultiThreadedExecutor(30) 
