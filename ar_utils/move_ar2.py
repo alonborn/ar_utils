@@ -16,7 +16,7 @@ from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstrai
 from shape_msgs.msg import SolidPrimitive
 from rclpy.action import ActionClient
 import threading
-
+import time
 
 #view end effector position
 #ros2 run tf2_ros tf2_echo base_link ee_link
@@ -27,7 +27,7 @@ class MoveAR(Node):
         self._action_client = ActionClient(self, MoveGroup, '/move_action')  # Default MoveGroup interface
         self._move_in_progress = False
         self._move_done_event = threading.Event()
-
+        self.move_result = False
         self.callback_group = ReentrantCallbackGroup()
         # Create service that listens for Pose messages
         self.srv = self.create_service(
@@ -183,18 +183,20 @@ class MoveAR(Node):
         try: 
             result = future.result().result
             self.get_logger().info(f"Action completed with result: {result.error_code.val}")
-            current_pose = self.get_current_ee_pose()
-            
-            diff = self.pose_difference(current_pose, self.target_pose)
-            print({
-                'position_diff': {axis: f"{val:.2f}" for axis, val in diff['position_diff'].items()},
-                'orientation_diff': {axis: f"{val:.2f}" for axis, val in diff['orientation_diff'].items()}
-            })
+            self.move_result = result.error_code.val
+
+            if (self.move_result == 99999):
+                self.get_logger().info("Move did not complete")
+                self._move_in_progress = False
+                self._move_done_event.set() 
+                return  
+
         except Exception as e: 
             self.get_logger().error(f"Failed to get result: {e}")
         finally:
             self._move_in_progress = False
             self._move_done_event.set()
+            self.get_logger().info("Move completed 1")
 
     def handle_move_ar(self, request: MoveToPose.Request, response:MoveToPose.Response):
         """Callback function for the 'ar_move_to' service."""
@@ -202,19 +204,14 @@ class MoveAR(Node):
         
         pose_to_move = request.pose
         
-        #pose_to_move = Pose()
-        # pose_to_move.position = Point(x=0.04, y=-0.31, z=0.375)
-
-        # pose_to_move.orientation.x = 0.044
-        # pose_to_move.orientation.y = -0.702
-        # pose_to_move.orientation.z = 0.71
-        # pose_to_move.orientation.w = -0.033
-
-
         self.send_pose_goal(pose_to_move)
+        self.get_logger().info("Waiting for wait to complete...")
         self._move_done_event.wait(30)  # Wait for 30 seconds or until the move is done
-        response.success = True
-        response.message = "Move command received"        
+        # time.sleep(4)
+        
+        self.get_logger().info("wait completed")
+        response.success = True if self.move_result == 0 else False
+        response.message = "Move command completed"        
         return response  
 
 def main():
