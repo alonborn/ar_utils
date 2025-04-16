@@ -198,32 +198,26 @@ class MoveAR(Node):
 
     def handle_move_ar(self, request: MoveToPose.Request, response:MoveToPose.Response):
         """Callback function for the 'ar_move_to' service."""
-        self.get_logger().info(f"Received move request: Position ({request.pose.position}, Orientation {request.pose.orientation.z})")
+        self.get_logger().info(f"Received move request: Position ({request.pose.position}, Orientation {request.pose.orientation})")
         
         pose_to_move = request.pose
         
-        pose_to_move = Pose()
-        pose_to_move.position = Point(x=0.04, y=-0.31, z=0.375)
+        #pose_to_move = Pose()
+        # pose_to_move.position = Point(x=0.04, y=-0.31, z=0.375)
 
-        pose_to_move.orientation.x = 0.044
-        pose_to_move.orientation.y = -0.702
-        pose_to_move.orientation.z = 0.71
-        pose_to_move.orientation.w = -0.033
+        # pose_to_move.orientation.x = 0.044
+        # pose_to_move.orientation.y = -0.702
+        # pose_to_move.orientation.z = 0.71
+        # pose_to_move.orientation.w = -0.033
 
-        
 
-        #self.logger.info(f"moving to: {pose_to_move}")
-        #time.sleep(2)
-        #self.move_to(pose_to_move)
         self.send_pose_goal(pose_to_move)
         self._move_done_event.wait(30)  # Wait for 30 seconds or until the move is done
         response.success = True
         response.message = "Move command received"        
-        return response  # ✅ This was missing
+        return response  
 
 def main():
-
-    # #Allow attaching the debugger remotely on port 5678
     # debugpy.listen(("0.0.0.0", 5678))
     # print("Waiting for debugger to attach...")
     # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
