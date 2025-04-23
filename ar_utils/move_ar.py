@@ -23,6 +23,8 @@ import logging
 import debugpy
 import atexit
 import time
+from pymoveit2.moveit2 import init_execute_trajectory_goal
+
 
 
 import rclpy
@@ -47,6 +49,7 @@ class MoveAR(Node):
 
     def __init__(self):
         super().__init__("move_ar")
+        self.get_logger().info("\033[92mStarting Init\033[0m")
         self.logger = self.get_logger()
 
         # Create a secondary logger for file output
@@ -63,7 +66,7 @@ class MoveAR(Node):
 
         # Attach the handler to the new logger
         self.file_logger.addHandler(file_handler)
-
+        self.shared_cb_group = ReentrantCallbackGroup()
         # Define callback group for service
         self.callback_group = ReentrantCallbackGroup()
         # Create service that listens for Pose messages
@@ -71,7 +74,7 @@ class MoveAR(Node):
             MoveToPose,  # Service type
             'ar_move_to_pose',  # Service name
             self.handle_move_ar,  # Callback function
-            callback_group=self.callback_group
+            callback_group=self.shared_cb_group
         )
         
         self.get_logger().info("\033[92mService 'ar_move_to' is ready to receive Pose messages.\033[0m")
@@ -87,13 +90,14 @@ class MoveAR(Node):
         # while not self.client.wait_for_service(timeout_sec=1.0):
         #     self.get_logger().info('Service /move_group not available, waiting again...')
 
+
         self.moveit2 = MoveIt2(
             node=self,
             joint_names=self.arm_joint_names,
             base_link_name="base_link",
             end_effector_name="link_6",
             group_name="ar_manipulator",
-            callback_group=ReentrantCallbackGroup()
+            callback_group=self.shared_cb_group
         )
         self.moveit2.planner_id = "RRTConnectkConfigDefault"
         self.moveit2.max_velocity = 1.0
@@ -107,7 +111,7 @@ class MoveAR(Node):
         
         #Timer: callback every 2.0 seconds
         self.timer_callback_group = ReentrantCallbackGroup()
-        self.timer = self.create_timer(2.0, self.timer_callback,callback_group=self.timer_callback_group)
+        self.timer = self.create_timer(2.0, self.timer_callback,callback_group=self.shared_cb_group)
 
         self._move_done_event = threading.Event()
         self._move_in_progress = False
@@ -174,47 +178,41 @@ class MoveAR(Node):
         self.logger.info("About to return service response")  # Add this log
         return response
 
-    
     def move_to(self, msg: Pose):
         if self._move_in_progress:
             self.logger.warn("Move already in progress. Ignoring new move request.")
             return
 
-        def _move_thread():
-            self._move_in_progress = True
-            self._move_done_event.clear()
-            try:
-                pose_goal = PoseStamped() 
-                pose_goal.header.frame_id = "base_link"
-                pose_goal.pose = msg
-                print ("starting to move")
-                self.moveit2.move_to_pose(pose=pose_goal)
-                self.logger.info("Waiting1 for move to finish...")
-                ret = self.moveit2.wait_until_executed() 
+        self._move_in_progress = True
+        self._move_done_event.clear()
+        try:
+            pose_goal = PoseStamped() 
+            pose_goal.header.frame_id = "base_link"
+            pose_goal.pose = msg
+            print ("starting to move")
+            self.moveit2.move_to_pose(pose=pose_goal)
+            self.logger.info("Waiting1 for move to finish...")
+            ret = self.moveit2.wait_until_executed() 
 
-                self.logger.info("Move finished")
-                #self.logger.info(f"Move finished with result: {ret}") 
-                self.logger.info(f"Move finished with result") 
-            except Exception as e:
-                self.logger.error(f"Error during move: {e}")
-                #self.file_logger.error(f"Error during move: {e}")
-            finally:
-                self._move_in_progress = False
-                self._move_done_event.set()
-                self.logger.info("Move thread ended.")
-
-        thread = threading.Thread(target=_move_thread, daemon=True)
-        thread.start()
-
+            self.logger.info("Move finished")
+            #self.logger.info(f"Move finished with result: {ret}") 
+            self.logger.info(f"Move finished with result") 
+        except Exception as e:
+            self.logger.error(f"Error during move: {e}")
+            #self.file_logger.error(f"Error during move: {e}")
+        finally:
+            self._move_in_progress = False
+            self._move_done_event.set()
+            self.logger.info("Move thread ended.")
 
 
 def main():
 
-    #Allow attaching the debugger remotely on port 5678
-    # debugpy.listen(("0.0.0.0", 5678))
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
     
+    debugpy.listen(("0.0.0.0", 5678))
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
+    print("debugger attached...")
     
     # atexit.register(lambda: print("⚠️  Shutdown triggered via atexit"))
     # original_shutdown = rclpy.shutdown
