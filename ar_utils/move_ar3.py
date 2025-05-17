@@ -17,55 +17,36 @@ class PoseGoalNode(Node):
     def __init__(self):
         super().__init__('pose_goal_node')
 
-        # Declare parameters
-        self.declare_parameter("position", [0.5, 0.0, 0.25])
-        self.declare_parameter("quat_xyzw", [1.0, 0.0, 0.0, 0.0])
-        self.declare_parameter("synchronous", True)
-        self.declare_parameter("cancel_after_secs", 0.0)
-        self.declare_parameter("planner_id", "RRTConnectkConfigDefault")
-        self.declare_parameter("cartesian", False)
-        self.declare_parameter("cartesian_max_step", 0.0025)
-        self.declare_parameter("cartesian_fraction_threshold", 0.0)
-        self.declare_parameter("cartesian_jump_threshold", 0.0)
-        self.declare_parameter("cartesian_avoid_collisions", False)
+        #Timer: callback every 2.0 seconds
+        self.timer_callback_group = ReentrantCallbackGroup()
+        #self.timer_callback_group = self.callback_group
+        self.timer = self.create_timer(2.0, self.timer_callback,callback_group=self.timer_callback_group)
 
-        # Callback group
-        self.callback_group = ReentrantCallbackGroup()
+        self.init_moveit()
 
+    def init_moveit(self):
         self.arm_joint_names = [
             "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
         ]
-
-        # MoveIt2 interface
         self.moveit2 = MoveIt2(
             node=self,
             joint_names=self.arm_joint_names,
             base_link_name="base_link",
             end_effector_name="link_6",
             group_name="ar_manipulator",
-            callback_group=self.callback_group,
+            callback_group=self.callback_group
         )
+
         self.moveit2.planner_id = "RRTConnectkConfigDefault"
         self.moveit2.max_velocity = 1.0
         self.moveit2.max_acceleration = 1.0
+        self.moveit2.planning_time = 5.0  # Timeout in seconds
 
-        #Timer: callback every 2.0 seconds
-        self.timer_callback_group = ReentrantCallbackGroup()
-        #self.timer_callback_group = self.callback_group
-        self.timer = self.create_timer(2.0, self.timer_callback,callback_group=self.timer_callback_group)
-
-        self.get_logger().info('ar_move_to_pose node started')
-        self.action_server = ActionServer(
-            self,
-            MoveToPoseAc,
-            'ar_move_to_pose',
-            self.execute_callback,
-            callback_group=self.callback_group
-        )
-        self.get_logger().info('ar_move_to_pose action server started')
-
-        # Execute motion
-        #self.execute_pose_goal()
+        # Scale down velocity and acceleration of joints (percentage of maximum)
+        self.moveit2.max_velocity = 0.5
+        self.moveit2.max_acceleration = 0.5
+        self.moveit2.cartesian_avoid_collisions = False
+        self.moveit2.cartesian_jump_threshold = 0.0
 
     async def execute_callback(self, goal_handle):
         self.get_logger().info('Executing goal...')

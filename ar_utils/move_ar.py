@@ -84,13 +84,6 @@ class MoveAR(Node):
             "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
         ]
 
-
-        # Create an action client for MoveGroup
-        # self.client = self.create_client(MoveGroupAction, '/move_group')
-        # while not self.client.wait_for_service(timeout_sec=1.0):
-        #     self.get_logger().info('Service /move_group not available, waiting again...')
-
-
         self.moveit2 = MoveIt2(
             node=self,
             joint_names=self.arm_joint_names,
@@ -111,13 +104,17 @@ class MoveAR(Node):
         
         #Timer: callback every 2.0 seconds
         self.timer_callback_group = ReentrantCallbackGroup()
-        self.timer = self.create_timer(2.0, self.timer_callback,callback_group=self.shared_cb_group)
-
+        # self.timer = self.create_timer(2.0, self.timer_callback,callback_group=self.shared_cb_group)
+        self.last_timer_time = time.time()
         self._move_done_event = threading.Event()
         self._move_in_progress = False
-
+    
     def timer_callback(self):
-        self.get_logger().info('ROS loop is alive!')
+        now = time.time()
+        elapsed = now - self.last_timer_time
+        self.last_timer_time = now
+
+        self.get_logger().info(f'ROS loop is alive! Elapsed: {elapsed:.3f} seconds')
 
     def write_to_logger(self, transformed_pose):
         # Extract position values
@@ -138,93 +135,97 @@ class MoveAR(Node):
         
 
     def handle_move_ar(self, request: MoveToPose.Request, response:MoveToPose.Response):
-        self.get_logger().info(f"\n\n\n\n\n\n\n")
-        print("")
-        print("")
-        print("")
-        print("")
-
-        #Callback function for the 'ar_move_to' service.
+         #Callback function for the 'ar_move_to' service.
         self.get_logger().info(f"Received move request: Position ({request.pose.position.x}, {request.pose.position.y}, {request.pose.position.z})")
         self.get_logger().info(f"Orientation: ({request.pose.orientation.x}, {request.pose.orientation.y}, {request.pose.orientation.z}, {request.pose.orientation.w})")
        
-        # pose_to_move = Pose()
-        # pose_to_move.position.x = 0.04
-        # pose_to_move.position.y = -0.31
-        # pose_to_move.position.z = 0.375
-        # pose_to_move.orientation.x = 0.044
-        # pose_to_move.orientation.y = -0.702
-        # pose_to_move.orientation.z = 0.71
-        # pose_to_move.orientation.w = -0.033
 
         pose_to_move = request.pose
+        cartesian = request.cartesian
 
         self.logger.info(f"moving to: {pose_to_move}")
-        #time.sleep(2)
-        self.move_to(pose_to_move)
+        
+        timeout = 30 #request.timeout_sec
+        start_time = time.time()
+        self.moveit2.set_is_executing(True)
+        if cartesian:
+            self.logger.info("Moving in Cartesian space")
+            ret_val = self.MoveArmCartesian(pose_to_move.position, pose_to_move.orientation)
+        else:
+            self.logger.info("Moving in joint space")
+            ret_val = self.MoveArm(pose_to_move.position, pose_to_move.orientation)
 
-        # Wait for movement to finish before returning response
-        self._move_done_event.wait(30)  # Wait for 30 seconds or until the move is done
 
-        self.logger.info(f"Done moving: {pose_to_move}")
+        # Blocking wait
+        while self.moveit2.is_executing() == True:
+            #self.get_logger().info("Waiting for motion to complete...")
+            if time.time() - start_time > timeout:
+                response.success = False
+                response.message = "Timeout reached"
+                return response
+            time.sleep(0.05)
+        self.get_logger().info("Motion completed")
+        response.success = self.moveit2.motion_suceeded
+        response.message = "Motion completed" if self.moveit2.motion_suceeded else "Motion failed"
 
-        response.status = True
-        response.message = "ok"
+        self.get_logger().info(f"Move result: {response.success}, Message: {response.message}")
 
-        # Force reset all state flags
-        self._move_in_progress = False
-        self._move_done_event.clear()  # Make sure we reset the event
-                
-        self.logger.info("About to return service response")  # Add this log
         return response
 
-    def move_to(self, msg: Pose):
-        if self._move_in_progress:
-            self.logger.warn("Move already in progress. Ignoring new move request.")
-            return
-
-        self._move_in_progress = True
-        self._move_done_event.clear()
+    def MoveArm(self, position, quat_xyzw):
+        time.sleep(0.5) #for some reason the arm is not available immediately after the call
+        pose_goal = PoseStamped() 
+        pose_goal.header.frame_id = "base_link"
+        pose_goal.pose = Pose(position = position, orientation = quat_xyzw)
+        print ("starting to move")
+        ret_val = False
         try:
-            pose_goal = PoseStamped() 
-            pose_goal.header.frame_id = "base_link"
-            pose_goal.pose = msg
-            print ("starting to move")
             self.moveit2.move_to_pose(pose=pose_goal)
-            self.logger.info("Waiting1 for move to finish...")
-            ret = self.moveit2.wait_until_executed() 
-
-            self.logger.info("Move finished")
-            #self.logger.info(f"Move finished with result: {ret}") 
-            self.logger.info(f"Move finished with result") 
-        except Exception as e:
-            self.logger.error(f"Error during move: {e}")
-            #self.file_logger.error(f"Error during move: {e}")
         finally:
-            self._move_in_progress = False
-            self._move_done_event.set()
-            self.logger.info("Move thread ended.")
+            print ("move completed")
+        return ret_val
 
+    def MoveArmCartesian(self, position, quat_xyzw):
+        """
+        Moves the robot arm to a given position and orientation using Cartesian path planning.
+
+        Args:
+            position: Tuple or geometry_msgs.msg.Point (x, y, z)
+            quat_xyzw: Tuple or geometry_msgs.msg.Quaternion (x, y, z, w)
+
+        Returns:
+            True if motion succeeded, False otherwise.
+        """
+        time.sleep(0.5)  # Allow time for arm/controller to become ready
+        print("Starting Cartesian motion...")
+
+        ret_val = False
+        try:
+            self.moveit2.move_to_pose(
+                position=position,
+                quat_xyzw=quat_xyzw,
+                cartesian=True,
+                cartesian_max_step=0.0025,  # Step size in meters
+                cartesian_fraction_threshold=0.9  # Minimum fraction of path to accept
+            )
+            #ret_val = self.moveit2.wait_until_executed()
+            #self.poll_until_done(callback=lambda success: print(f"Motion success: {success}"))
+
+        finally:
+            print("Cartesian motion completed")
+
+        return ret_val
 
 def main():
-
+    # debugpy.listen(("0.0.0.0", 5678))
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
+    # print("debugger attached...")
     
-    debugpy.listen(("0.0.0.0", 5678))
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
-    print("debugger attached...")
-    
-    # atexit.register(lambda: print("⚠️  Shutdown triggered via atexit"))
-    # original_shutdown = rclpy.shutdown
-    # def my_shutdown(*args, **kwargs):
-    #     print("⚠️  rclpy.shutdown() was called!")
-    #     return original_shutdown(*args, **kwargs)
-    # rclpy.shutdown = my_shutdown
-
 
     rclpy.init()
     node = MoveAR()
-    executor = MultiThreadedExecutor(30) 
+    executor = MultiThreadedExecutor(20) 
     executor.add_node(node)
     try:
         executor.spin()
