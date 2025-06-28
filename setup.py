@@ -17,7 +17,9 @@ setup(
     maintainer_email='alonborn@gmail.com',
     description='TODO: Package description',
     license='Apache-2.0',
-    tests_require=['pytest'],
+    extras_require={
+    'test': ['pytest'],
+    },  
     entry_points={
         'console_scripts': [
             'move_ar = ar_utils.move_ar:main',  # Entry point for your node
