@@ -134,96 +134,135 @@ class MoveAR(Node):
         self.file_logger.info(f"Position: {x},{y},{z} | Rotation: {qx},{qy},{qz},{qw}")
         
 
-    def handle_move_ar(self, request: MoveToPose.Request, response:MoveToPose.Response):
-         #Callback function for the 'ar_move_to' service.
+    def handle_move_ar(self, request: MoveToPose.Request, response: MoveToPose.Response):
+        """Callback for the 'ar_move_to' service: receives a pose, plans and executes the move, and responds."""
         self.get_logger().info(f"Received move request: Position ({request.pose.position.x}, {request.pose.position.y}, {request.pose.position.z})")
         self.get_logger().info(f"Orientation: ({request.pose.orientation.x}, {request.pose.orientation.y}, {request.pose.orientation.z}, {request.pose.orientation.w})")
-       
 
         pose_to_move = request.pose
         cartesian = request.cartesian
 
-        self.logger.info(f"moving to: {pose_to_move}")
-        
-        timeout = 30 #request.timeout_sec
+        self.logger.info(f"Moving to: {pose_to_move}")
+
+        timeout = 30  # seconds
         start_time = time.time()
+
+        planning_success = False
         self.moveit2.set_is_executing(True)
+
         if cartesian:
             self.logger.info("Moving in Cartesian space")
-            ret_val = self.MoveArmCartesian(pose_to_move.position, pose_to_move.orientation)
+            planning_success = self.MoveArmCartesian(pose_to_move.position, pose_to_move.orientation)
         else:
             self.logger.info("Moving in joint space")
-            ret_val = self.MoveArm(pose_to_move.position, pose_to_move.orientation)
+            planning_success = self.MoveArm(pose_to_move.position, pose_to_move.orientation)
 
+        if not planning_success:
+            response.success = False
+            response.message = "Planning failed"
+            self.logger.warn("Planning failed; returning early without execution.")
+            return response
 
-        # Blocking wait
-        while self.moveit2.is_executing() == True:
-            #self.get_logger().info("Waiting for motion to complete...")
-            if time.time() - start_time > timeout:
+        # If planning succeeded, wait for execution to complete
+        self.get_logger().info("Waiting for motion to complete...")
+        while self.moveit2.is_executing():
+            elapsed = time.time() - start_time
+            self.get_logger().info(f"Still waiting for motion to complete... elapsed {elapsed:.1f}s")
+            if elapsed > timeout:
                 response.success = False
                 response.message = "Timeout reached"
+                self.logger.error("Execution timeout reached; aborting motion.")
                 return response
             time.sleep(0.05)
+
         self.get_logger().info("Motion completed")
         response.success = self.moveit2.motion_suceeded
         response.message = "Motion completed" if self.moveit2.motion_suceeded else "Motion failed"
 
         self.get_logger().info(f"Move result: {response.success}, Message: {response.message}")
-
         return response
 
+
     def MoveArm(self, position, quat_xyzw):
-        time.sleep(0.5) #for some reason the arm is not available immediately after the call
-        pose_goal = PoseStamped() 
+        """Plans and executes a joint-space move to the target pose."""
+        time.sleep(0.5)  # Allow time for arm/controller to become ready
+
+        self.logger.info("Starting joint-space motion...")
+
+        pose_goal = PoseStamped()
         pose_goal.header.frame_id = "base_link"
-        pose_goal.pose = Pose(position = position, orientation = quat_xyzw)
-        print ("starting to move")
-        ret_val = False
+        pose_goal.pose = Pose(position=position, orientation=quat_xyzw)
+
         try:
-            self.moveit2.move_to_pose(pose=pose_goal)
-        finally:
-            print ("move completed")
-        return ret_val
+            success = self.moveit2.move_to_pose(
+                pose=pose_goal,
+                cartesian=False
+            )
+        except Exception as e:
+            self.logger.error(f"Joint-space planning failed: {e}")
+            return False
+
+        if not success:
+            self.logger.error("Joint-space planning failed; aborting motion.")
+            return False
+
+        self.logger.info("Joint-space motion planned successfully")
+        return True
+
 
     def MoveArmCartesian(self, position, quat_xyzw):
-        """
-        Moves the robot arm to a given position and orientation using Cartesian path planning.
-
-        Args:
-            position: Tuple or geometry_msgs.msg.Point (x, y, z)
-            quat_xyzw: Tuple or geometry_msgs.msg.Quaternion (x, y, z, w)
-
-        Returns:
-            True if motion succeeded, False otherwise.
-        """
+        """Plans and executes a Cartesian-space move to the target pose."""
         time.sleep(0.5)  # Allow time for arm/controller to become ready
-        print("Starting Cartesian motion...")
 
-        ret_val = False
+        self.logger.info("Starting Cartesian motion...")
+
         try:
-            self.moveit2.move_to_pose(
+            success = self.moveit2.move_to_pose(
                 position=position,
                 quat_xyzw=quat_xyzw,
                 cartesian=True,
-                cartesian_max_step=0.0025,  # Step size in meters
-                cartesian_fraction_threshold=0.9  # Minimum fraction of path to accept
+                cartesian_max_step=0.0025,           # Step size in meters
+                cartesian_fraction_threshold=0.9     # Minimum acceptable fraction
             )
-            #ret_val = self.moveit2.wait_until_executed()
-            #self.poll_until_done(callback=lambda success: print(f"Motion success: {success}"))
+        except Exception as e:
+            self.logger.error(f"Cartesian planning failed with exception: {e}")
+            return False
 
-        finally:
-            print("Cartesian motion completed")
+        if not success:
+            self.logger.error("Cartesian planning failed; aborting motion.")
+            return False
 
-        return ret_val
+        self.logger.info("Cartesian motion planned successfully")
+        return True
+
 
 def main():
     # debugpy.listen(("0.0.0.0", 5678))
     # print("Waiting for debugger to attach...")
     # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
     # print("debugger attached...")
-    
-
     rclpy.init()
+    
+     # Create a temporary node to query the ROS graph
+    tmp_node = rclpy.create_node('_node_checker')
+    existing_nodes = tmp_node.get_node_names()
+    tmp_node.destroy_node()
+
+    print("Existing nodes in the ROS graph:")
+    move_ar_count = 0
+    for n in existing_nodes:
+        print(f" - {n}")
+        if n.lstrip('/').startswith('move_ar'):
+            move_ar_count += 1
+
+    if move_ar_count > 1:
+        print(f"[ERROR] Detected {move_ar_count} 'move_ar' nodes already running. Exiting.")
+        rclpy.shutdown()
+        return
+    else:
+        print(f"[INFO] Detected {move_ar_count} existing 'move_ar' node(s) (including self). Continuing...")
+        
+
     node = MoveAR()
     executor = MultiThreadedExecutor(20) 
     executor.add_node(node)
@@ -235,4 +274,5 @@ def main():
 
 
 if __name__ == "__main__":
+    
     main()

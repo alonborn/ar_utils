@@ -40,7 +40,7 @@ class MoveAR(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
-        self.get_logger().info("\033[92mService 'ar_move_to' is ready to receive Pose messages.\033[0m")
+        # self.get_logger().info("\033[92mService 'ar_move_to' is ready to receive Pose messages.\033[0m")
 
         #Timer: callback every 2.0 seconds
         # self.timer_callback_group = ReentrantCallbackGroup()
