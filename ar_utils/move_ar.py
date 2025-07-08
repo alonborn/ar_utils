@@ -203,10 +203,10 @@ class MoveAR(Node):
             return False
 
         if not success:
-            self.logger.error("Joint-space planning failed; aborting motion.")
+            self.logger.error(f"Joint-space planning failed; aborting motion. success: {success}")
             return False
 
-        self.logger.info("Joint-space motion planned successfully")
+        self.logger.info("Joint-space motion planned successfully, sucess:" + str(success))
         return True
 
 
@@ -217,12 +217,14 @@ class MoveAR(Node):
         self.logger.info("Starting Cartesian motion...")
 
         try:
+            self.get_logger().info(f"cartesian_max_step: 0.01, cartesian_fraction_threshold: 0.2")
             success = self.moveit2.move_to_pose(
                 position=position,
                 quat_xyzw=quat_xyzw,
                 cartesian=True,
-                cartesian_max_step=0.0025,           # Step size in meters
-                cartesian_fraction_threshold=0.9     # Minimum acceptable fraction
+                # cartesian_max_step=0.0025,           # Step size in meters
+                cartesian_max_step=0.01,           # Step size in meters
+                cartesian_fraction_threshold=0.2     # Minimum acceptable fraction
             )
         except Exception as e:
             self.logger.error(f"Cartesian planning failed with exception: {e}")
@@ -237,10 +239,10 @@ class MoveAR(Node):
 
 
 def main():
-    # debugpy.listen(("0.0.0.0", 5678))
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
-    # print("debugger attached...")
+    debugpy.listen(("0.0.0.0", 5678))
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
+    print("debugger attached...")
     rclpy.init()
     
      # Create a temporary node to query the ROS graph
@@ -274,5 +276,4 @@ def main():
 
 
 if __name__ == "__main__":
-    
     main()
