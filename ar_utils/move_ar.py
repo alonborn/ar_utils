@@ -19,6 +19,10 @@ from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Pose,Vector3
 #from tf2_geometry_msgs import do_transform_pose
 from pymoveit2 import MoveIt2
+import pymoveit2
+
+
+
 import logging
 import debugpy
 import atexit
@@ -183,7 +187,7 @@ class MoveAR(Node):
         return response
 
 
-    def MoveArm(self, position, quat_xyzw):
+    def MoveArmOld(self, position, quat_xyzw):
         """Plans and executes a joint-space move to the target pose."""
         time.sleep(0.5)  # Allow time for arm/controller to become ready
 
@@ -208,6 +212,61 @@ class MoveAR(Node):
 
         self.logger.info("Joint-space motion planned successfully, sucess:" + str(success))
         return True
+
+    def MoveArm(self, position, quat_xyzw):
+        """Plans and executes a joint-space move to the target pose, via an automatically computed via‐point."""
+        time.sleep(0.5)  # Allow time for arm/controller to become ready
+
+        self.logger.info("Starting joint-space motion...")
+
+        # build the final target pose
+        target_pose = PoseStamped()
+        target_pose.header.frame_id = "base_link"
+        target_pose.pose = Pose(position=position, orientation=quat_xyzw)
+
+        # ← **NEW** compute an intermediate via‐point to avoid flips/singularities
+        try:
+            via_pose = self.moveit2.find_via_point(target_pose)
+            self.logger.info(f"Via-point computed: {via_pose.pose.position}")
+        except Exception as e:
+            self.logger.warn(f"Via-point computation failed ({e}); will try direct move only.")
+            via_pose = None
+
+        # ← **NEW** if we got a via‐point, move there first
+        if via_pose is not None:
+            try:
+                success = self.moveit2.move_to_pose(
+                    pose=via_pose,
+                    cartesian=False
+                )
+            except Exception as e:
+                self.logger.error(f"Joint-space planning to via-point failed: {e}")
+                return False
+
+            if not success:
+                self.logger.error(f"Failed to reach via-point; aborting motion.")
+                return False
+
+            self.logger.info("Reached via-point successfully; now moving to final target.")
+
+        # now do the normal move to the final pose
+        try:
+            success = self.moveit2.move_to_pose(
+                pose=target_pose,
+                cartesian=False
+            )
+        except Exception as e:
+            self.logger.error(f"Joint-space planning to final target failed: {e}")
+            return False
+
+        if not success:
+            self.logger.error("Joint-space planning failed; aborting motion.")
+            return False
+
+        self.logger.info("Joint-space motion planned and executed successfully.")
+        return True
+
+
 
 
     def MoveArmCartesian(self, position, quat_xyzw):
@@ -239,10 +298,10 @@ class MoveAR(Node):
 
 
 def main():
-    # debugpy.listen(("0.0.0.0", 5678))
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
-    # print("debugger attached...")
+    debugpy.listen(("0.0.0.0", 5678))
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
+    print("debugger attached...")
 
     
     rclpy.init()
@@ -266,6 +325,7 @@ def main():
     else:
         print(f"[INFO] Detected {move_ar_count} existing 'move_ar' node(s) (including self). Continuing...")
         
+    print(f"[DEBUG] pymoveit2 loaded from: {pymoveit2.__file__}")
 
     node = MoveAR()
     executor = MultiThreadedExecutor(20) 
