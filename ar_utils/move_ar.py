@@ -13,11 +13,17 @@ from geometry_msgs.msg import Point
 # from moveit_commander.action import MoveGroupAction, MoveGroupGoal
 from moveit_msgs.action import MoveGroup
 import threading
-
+import sys
 import tf2_ros
 from geometry_msgs.msg import PoseStamped
+from typing import Optional
+import os
+from datetime import datetime
+
 from geometry_msgs.msg import Pose,Vector3
 #from tf2_geometry_msgs import do_transform_pose
+sys.path.insert(0, '/home/alon/ros_ws/src/pymoveit2')
+
 from pymoveit2 import MoveIt2
 import pymoveit2
 
@@ -148,7 +154,7 @@ class MoveAR(Node):
 
         self.logger.info(f"Moving to: {pose_to_move}")
 
-        timeout = 30  # seconds
+        timeout = 230  # seconds
         start_time = time.time()
 
         planning_success = False
@@ -171,7 +177,7 @@ class MoveAR(Node):
         self.get_logger().info("Waiting for motion to complete...")
         while self.moveit2.is_executing():
             elapsed = time.time() - start_time
-            self.get_logger().info(f"Still waiting for motion to complete... elapsed {elapsed:.1f}s")
+            # self.get_logger().info(f"Still waiting for motion to complete... elapsed {elapsed:.1f}s")
             if elapsed > timeout:
                 response.success = False
                 response.message = "Timeout reached"
@@ -213,7 +219,198 @@ class MoveAR(Node):
         self.logger.info("Joint-space motion planned successfully, sucess:" + str(success))
         return True
 
+    def _on_via_point_found(self, via_pose: Optional[PoseStamped]):
+        if via_pose is None:
+            self.get_logger().warn("No valid via-point found. Attempting direct move to goal.")
+            # Try direct move
+            # self.moveit2.move_to_pose_async(
+            #     pose=self.goal_pose,
+            #     callback=self._on_motion_done,
+            #     path_constraints=self._move_action_goal.request.path_constraints
+            #         if hasattr(self, "_move_action_goal") else None
+            # )
+            return
+
+        self.get_logger().info("Via-point found. Moving to via-point first.")
+
+        # First move to the via-point
+        # self.moveit2.move_to_pose_async(
+        #     pose=via_pose,
+        #     callback=self._on_via_reached
+        # )
+
+
+
+    def _on_start_pose_ready(self, future):
+        try:
+            poses = future.result()
+            start_pose = poses[0]  # assuming only one link requested
+            self.start_pose = start_pose
+            self.get_logger().info(f"Got FK pose: {start_pose}")
+            
+            # Now continue with whatever needs this pose
+            self.find_via_point(
+                start=start_pose,
+                goal=self.goal_pose,
+                steps=20,
+                callback=self._on_via_point_found
+            )
+        except Exception as e:
+            self.get_logger().error(f"Failed to get FK: {e}")
+
+
+
+    def get_start_pose_async(self):
+        future = self.moveit2.compute_fk_async(
+            joint_state=self.moveit2.joint_state,
+            fk_link_names=[self.moveit2.end_effector_name]
+        )
+        future.add_done_callback(self._on_start_pose_ready)
+
+
+    def _log_motion_to_file(self, motion_type, success, start_pose=None, via_pose=None, target_pose=None):
+        log_path = os.path.expanduser("~/arm_motion.log")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        def fmt(pose):
+            if not pose:
+                return "None"
+            if isinstance(pose, list):
+                pose = pose[0]
+            if hasattr(pose, 'pose'):
+                pos = pose.pose.position
+                ori = pose.pose.orientation
+                return f"pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f}) ori=({ori.x:.3f},{ori.y:.3f},{ori.z:.3f},{ori.w:.3f})"
+            elif isinstance(pose, Pose):
+                pos = pose.position
+                ori = pose.orientation
+                return f"pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f}) ori=({ori.x:.3f},{ori.y:.3f},{ori.z:.3f},{ori.w:.3f})"
+            elif isinstance(pose, Point):
+                return f"pos=({pose.x:.3f},{pose.y:.3f},{pose.z:.3f})"
+            else:
+                return f"UnknownType({type(pose)})"
+        
+        log_entry = f"[{now}] Motion: {motion_type}, Success: {success}, Start: {fmt(start_pose)}, Via: {fmt(via_pose)}, Target: {fmt(target_pose)}\n"
+        with open(log_path, "a") as f:
+            f.write(log_entry)
+
+
+    def _interpolate_pose(self, pose1, pose2, alpha=0.5):
+        """Linear interpolation of two poses (position only, keeps orientation of pose1)."""
+        p1 = pose1.pose.position
+        p2 = pose2.pose.position
+        mid = PoseStamped()
+        mid.header.frame_id = "base_link"
+        mid.pose.position.x = (1 - alpha) * p1.x + alpha * p2.x
+        mid.pose.position.y = (1 - alpha) * p1.y + alpha * p2.y
+        mid.pose.position.z = (1 - alpha) * p1.z + alpha * p2.z
+        mid.pose.orientation = pose1.pose.orientation  # keep start orientation for simplicity
+        return mid
+
+    def _pose_distance(self, pose1, pose2):
+        """Euclidean distance between two positions."""
+        p1 = pose1.pose.position
+        p2 = pose2.pose.position
+        return ((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2) ** 0.5
+
+    def _pose_to_str(self, pose):
+        p = pose.pose.position
+        return f"({p.x:.3f}, {p.y:.3f}, {p.z:.3f})"
+    def _midpoint(self, p1, p2):
+        """Return the midpoint between two geometry_msgs.msg.Point objects."""
+        return Point(
+            x=(p1.x + p2.x) / 2.0,
+            y=(p1.y + p2.y) / 2.0,
+            z=(p1.z + p2.z) / 2.0,
+        )
+
+
     def MoveArm(self, position, quat_xyzw):
+        """Plans and executes a joint-space move to the target pose, subdividing as needed to avoid planning failures."""
+        time.sleep(0.5)  # Allow time for arm/controller to become ready
+
+        self.logger.info("Starting joint-space motion...")
+
+        # Build target pose
+        target_pose = PoseStamped()
+        target_pose.header.frame_id = "base_link"
+        target_pose.pose = Pose(position=position, orientation=quat_xyzw)
+
+        # Get current FK pose
+        start_fk = self.moveit2.compute_fk(
+            joint_state=self.moveit2.joint_state,
+            fk_link_names=[self.moveit2.end_effector_name]
+        )
+        if not start_fk:
+            self.logger.error("FK failed, cannot compute start pose.")
+            self._log_motion_to_file("Joint-space", False, None, None, target_pose)
+            return False
+        current_pose = start_fk[0]
+
+        # Stack for path segments (LIFO)
+        path_stack = [(current_pose, target_pose)]
+        successful_path = []
+        max_depth = 10
+        depth = 0
+
+        while path_stack and depth < max_depth:
+            from_pose, to_pose = path_stack.pop()
+            self.logger.info(f"Planning from {self._pose_to_str(from_pose)} to {self._pose_to_str(to_pose)}")
+
+            try:
+                success = self.moveit2.move_to_pose(pose=to_pose, cartesian=False)
+            except Exception as e:
+                self.logger.error(f"Planning failed with exception: {e}")
+                success = False
+
+            if success:
+                self.logger.info(f"Motion succeeded to {self._pose_to_str(to_pose)}")
+                successful_path.append(to_pose)
+
+                # Compute FK to get new robot pose
+                fk_result = self.moveit2.compute_fk(
+                    joint_state=self.moveit2.joint_state,
+                    fk_link_names=[self.moveit2.end_effector_name]
+                )
+                if not fk_result:
+                    self.logger.error("FK failed after motion; aborting.")
+                    self._log_motion_to_file("Joint-space", False, None, successful_path, target_pose)
+                    return False
+
+                new_pose = fk_result[0]
+
+                # Check if target is already reached (within small threshold)
+                if self._pose_distance(new_pose, target_pose) < 0.01:
+                    self.logger.info("Target reached successfully.")
+                    self._log_motion_to_file("Joint-space", True, current_pose, successful_path, target_pose)
+                    return True
+
+                # Not yet there; push remaining segment
+                path_stack.append((new_pose, target_pose))
+                continue
+
+            else:
+                # Planning failed — try to subdivide
+                self.logger.warn("Motion failed, subdividing...")
+
+                mid_pose = PoseStamped()
+                mid_pose.header.frame_id = "base_link"
+                mid_pose.pose.position = self._midpoint(from_pose.pose.position, to_pose.pose.position)
+                mid_pose.pose.orientation = to_pose.pose.orientation  # Use target orientation
+                self.logger.info(f"Subdividing path: {self._pose_to_str(from_pose)} to {self._pose_to_str(mid_pose)} and {self._pose_to_str(mid_pose)} to {self._pose_to_str(to_pose)}")    
+                path_stack.append((mid_pose, to_pose))
+                path_stack.append((from_pose, mid_pose))
+
+            depth += 1
+
+        # Failed to reach target
+        self.logger.error("Failed to reach final target after subdivisions.")
+        self._log_motion_to_file("Joint-space", False, current_pose, successful_path, target_pose)
+        return False
+
+
+
+    def MoveArmbeforesubdevision(self, position, quat_xyzw):
         """Plans and executes a joint-space move to the target pose, via an automatically computed via‐point."""
         time.sleep(0.5)  # Allow time for arm/controller to become ready
 
@@ -224,49 +421,68 @@ class MoveAR(Node):
         target_pose.header.frame_id = "base_link"
         target_pose.pose = Pose(position=position, orientation=quat_xyzw)
 
-        # ← **NEW** compute an intermediate via‐point to avoid flips/singularities
-        try:
-            via_pose = self.moveit2.find_via_point(target_pose)
-            self.logger.info(f"Via-point computed: {via_pose.pose.position}")
-        except Exception as e:
-            self.logger.warn(f"Via-point computation failed ({e}); will try direct move only.")
-            via_pose = None
+        # Compute current start pose from FK
+        start_pose = self.moveit2.compute_fk(
+            joint_state=self.moveit2.joint_state,
+            fk_link_names=[self.moveit2.end_effector_name]
+        )
+        if not start_pose:
+            self.logger.error("FK failed, cannot compute via-point.")
+            self._log_motion_to_file("Joint-space", False, start_pose, via_pose, target_pose)
 
-        # ← **NEW** if we got a via‐point, move there first
-        if via_pose is not None:
+            return False
+
+        # --- BLOCKING via-point computation ---
+        via_point_event = threading.Event()
+        via_point_result = {"pose": None}
+
+        def _on_via_point_found(pose):
+            via_point_result["pose"] = pose
+            via_point_event.set()
+
+        self.moveit2.find_via_point(start=start_pose, goal=target_pose, callback=_on_via_point_found)
+
+        if not via_point_event.wait(timeout=11112.0):  # Adjust timeout as needed
+            self.logger.warn("Timed out waiting for via-point computation.")
+            self._log_motion_to_file("Joint-space", False, start_pose, via_pose, target_pose)
+
+            return False
+
+        via_pose = via_point_result["pose"]
+        if via_pose:
             try:
-                success = self.moveit2.move_to_pose(
-                    pose=via_pose,
-                    cartesian=False
-                )
+                self.logger.info(f"Moving to via-point: {via_pose.pose.position}")
+                success = self.moveit2.move_to_pose(pose=via_pose, cartesian=False)
             except Exception as e:
                 self.logger.error(f"Joint-space planning to via-point failed: {e}")
+                self._log_motion_to_file("Joint-space", False, start_pose, via_pose, target_pose)
+
                 return False
 
             if not success:
                 self.logger.error(f"Failed to reach via-point; aborting motion.")
+                self._log_motion_to_file("Joint-space", False, start_pose, via_pose, target_pose)
                 return False
 
             self.logger.info("Reached via-point successfully; now moving to final target.")
 
         # now do the normal move to the final pose
         try:
-            success = self.moveit2.move_to_pose(
-                pose=target_pose,
-                cartesian=False
-            )
+            self.logger.info(f"Moving to final target: {target_pose.pose.position}")
+            success = self.moveit2.move_to_pose(pose=target_pose, cartesian=False)
         except Exception as e:
             self.logger.error(f"Joint-space planning to final target failed: {e}")
+            self._log_motion_to_file("Joint-space", False, start_pose, via_pose, target_pose)
             return False
 
-        if not success:
-            self.logger.error("Joint-space planning failed; aborting motion.")
-            return False
+        # if not success:
+        #     self.logger.error("Joint-space planning failed; aborting motion.")
+        #     return False
 
         self.logger.info("Joint-space motion planned and executed successfully.")
+        self._log_motion_to_file("Joint-space", True, start_pose, via_pose, target_pose)
+
         return True
-
-
 
 
     def MoveArmCartesian(self, position, quat_xyzw):
@@ -287,21 +503,27 @@ class MoveAR(Node):
             )
         except Exception as e:
             self.logger.error(f"Cartesian planning failed with exception: {e}")
+            self._log_motion_to_file("Cartesian", False, None, None, position)
+
             return False
 
         if not success:
             self.logger.error("Cartesian planning failed; aborting motion.")
+            self._log_motion_to_file("Cartesian", False, None, None, position)
+
             return False
 
         self.logger.info("Cartesian motion planned successfully")
+        self._log_motion_to_file("Cartesian", True, None, None, position)
+
         return True
 
 
 def main():
-    debugpy.listen(("0.0.0.0", 5678))
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
-    print("debugger attached...")
+    # debugpy.listen(("0.0.0.0", 5678))
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
+    # print("debugger attached...")
 
     
     rclpy.init()
