@@ -18,7 +18,7 @@ import tf2_ros
 from geometry_msgs.msg import PoseStamped
 from typing import Optional
 import os
-import datetime 
+import datetime
 
 from geometry_msgs.msg import Pose,Vector3
 #from tf2_geometry_msgs import do_transform_pose
@@ -281,7 +281,7 @@ class MoveAR(Node):
 
     def _log_motion_to_file(self, motion_type, success, start_pose=None, via_pose=None, target_pose=None):
         log_path = os.path.expanduser("~/arm_motion.log")
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         def fmt(pose):
             if not pose:
