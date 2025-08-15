@@ -220,10 +220,14 @@ class MoveAR(Node):
         self.moveit2.set_is_executing(True)
 
         if cartesian:
-            self.log_with_time('info' ,"Moving in Cartesian space")
+            # self.log_with_time('info' ,"Moving in Cartesian space")
+            print("Moving in Cartesian space")
+
             planning_success = self.MoveArmCartesian(pose_to_move.position, pose_to_move.orientation)
         else:
-            self.log_with_time('info' ,"Moving in joint space")
+            # self.log_with_time('info' ,"Moving in joint space")
+            print("Moving in joint space")
+
             planning_success = self.MoveArm(pose_to_move.position, pose_to_move.orientation)
 
         if not planning_success:
@@ -233,7 +237,7 @@ class MoveAR(Node):
             return response
 
         # If planning succeeded, wait for execution to complete
-        self.log_with_time('info' ,"Waiting for motion to complete...")
+        # self.log_with_time('info' ,"Waiting for motion to complete...")
         while self.moveit2.is_executing():
             elapsed = time.time() - start_time
             # self.log_with_time('info' ,f"Still waiting for motion to complete... elapsed {elapsed:.1f}s")
@@ -242,13 +246,14 @@ class MoveAR(Node):
                 response.message = "Timeout reached"
                 self.log_with_time('error' ,"Execution timeout reached; aborting motion.")
                 return response
+            # print("waiting for motion to complete2...")
             time.sleep(0.05)
 
         # self.log_with_time('info' ,"Motion completed")
         response.success = self.moveit2.motion_suceeded
         response.message = "Motion completed" if self.moveit2.motion_suceeded else "Motion failed"
 
-        self.log_with_time('info' ,f"Move result: {response.success}, Message: {response.message}")
+        # self.log_with_time('info' ,f"Move result: {response.success}, Message: {response.message}")
         return response
 
 
@@ -434,7 +439,8 @@ class MoveAR(Node):
                 self.log_with_time("error","Joint-space planning failed; aborting motion.")
                 return False
 
-            self.log_with_time("info","Joint-space motion planned and executed successfully.")
+            # self.log_with_time("info","Joint-space motion planned and executed successfully.")
+            print("Joint-space motion planned and executed successfully.")
             return True
 
 
