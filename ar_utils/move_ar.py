@@ -49,9 +49,45 @@ from std_msgs.msg import Header
 from trajectory_msgs.msg import JointTrajectory
 import threading
 
+import cProfile
+import pstats
+
 
 #view end effector position
 #ros2 run tf2_ros tf2_echo base_link ee_link
+
+import cProfile
+import pstats
+from io import StringIO
+import os
+
+import cProfile
+import pstats
+import functools
+import datetime
+import os
+from sensor_msgs.msg import JointState
+
+
+def profile_this(func):
+    @functools.wraps(func)  # <-- preserves original function name/signature for profiler
+    def wrapper(*args, **kwargs):
+        profiler = cProfile.Profile()
+        profiler.enable()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            profiler.disable()
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"profile_{func.__name__}_{timestamp}.stats"
+            profiler.dump_stats(filename)
+            print(f"[Profiler] Saved profiling data to {os.path.abspath(filename)}")
+
+            stats = pstats.Stats(profiler).sort_stats('cumtime')
+            print(f"[Profiler] {func.__name__} total time: {stats.total_tt:.4f}s")
+    return wrapper
+
+
 
 
         
@@ -88,6 +124,8 @@ class MoveAR(Node):
         
         self.log_with_time('info' ,"\033[92mService 'ar_move_to' is ready to receive Pose messages.\033[0m")
 
+        
+
 
         self.arm_joint_names = [
             "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
@@ -106,6 +144,13 @@ class MoveAR(Node):
         self.moveit2.max_acceleration = 1.0
         self.moveit2.planning_time = 5.0  # Timeout in seconds
 
+        self.create_subscription(
+            JointState,
+            '/joint_states',
+            self.joint_state_callback,
+            10
+        )
+
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -117,6 +162,9 @@ class MoveAR(Node):
         self.last_timer_time = time.time()
         self._move_done_event = threading.Event()
         self._move_in_progress = False
+
+    def joint_state_callback(self, msg):
+        self.moveit2.last_joint_state = msg
 
     def log_with_time(self, level, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -157,13 +205,13 @@ class MoveAR(Node):
 
     def handle_move_ar(self, request: MoveToPose.Request, response: MoveToPose.Response):
         """Callback for the 'ar_move_to' service: receives a pose, plans and executes the move, and responds."""
-        self.log_with_time('info' ,f"Received move request: Position ({request.pose.position.x}, {request.pose.position.y}, {request.pose.position.z})")
-        self.log_with_time('info' ,f"Orientation: ({request.pose.orientation.x}, {request.pose.orientation.y}, {request.pose.orientation.z}, {request.pose.orientation.w})")
+        # self.log_with_time('info' ,f"Received move request: Position ({request.pose.position.x}, {request.pose.position.y}, {request.pose.position.z})")
+        # self.log_with_time('info' ,f"Orientation: ({request.pose.orientation.x}, {request.pose.orientation.y}, {request.pose.orientation.z}, {request.pose.orientation.w})")
 
         pose_to_move = request.pose
         cartesian = request.cartesian
 
-        self.log_with_time('info' ,f"Moving to: {pose_to_move}")
+        # self.log_with_time('info' ,f"Moving to: {pose_to_move}")
 
         timeout = 230  # seconds
         start_time = time.time()
@@ -196,7 +244,7 @@ class MoveAR(Node):
                 return response
             time.sleep(0.05)
 
-        self.log_with_time('info' ,"Motion completed")
+        # self.log_with_time('info' ,"Motion completed")
         response.success = self.moveit2.motion_suceeded
         response.message = "Motion completed" if self.moveit2.motion_suceeded else "Motion failed"
 
@@ -335,8 +383,63 @@ class MoveAR(Node):
             z=(p1.z + p2.z) / 2.0,
         )
 
-
     def MoveArm(self, position, quat_xyzw):
+            """Plans and executes a joint-space move to the target pose, via an automatically computed via‐point."""
+            # time.sleep(0.5)  # Allow time for arm/controller to become ready
+
+            # self.log_with_time("info","Starting joint-space motion...")
+
+            # build the final target pose
+            target_pose = PoseStamped()
+            target_pose.header.frame_id = "base_link"
+            target_pose.pose = Pose(position=position, orientation=quat_xyzw)
+
+            # ← **NEW** compute an intermediate via‐point to avoid flips/singularities
+            via_pose = None
+            # try:
+            #     via_pose = self.moveit2.find_via_point(target_pose)
+            #     self.logger.info(f"Via-point computed: {via_pose.pose.position}")
+            # except Exception as e:
+            #     self.logger.warn(f"Via-point computation failed ({e}); will try direct move only.")
+            #     via_pose = None
+
+            # ← **NEW** if we got a via‐point, move there first
+            if via_pose is not None:
+                try:
+                    success = self.moveit2.move_to_pose(
+                        pose=via_pose,
+                        cartesian=False
+                    )
+                except Exception as e:
+                    self.log_with_time("error",f"Joint-space planning to via-point failed: {e}")
+                    return False
+
+                if not success:
+                    self.log_with_time("error",f"Failed to reach via-point; aborting motion.")
+                    return False
+
+                self.log_with_time("info","Reached via-point successfully; now moving to final target.")
+
+            # now do the normal move to the final pose
+            try:
+                success = self.moveit2.move_to_pose(
+                    pose=target_pose,
+                    cartesian=False
+                )
+            except Exception as e:
+                self.log_with_time("error",f"Joint-space planning to final target failed: {e}")
+                return False
+
+            if not success:
+                self.log_with_time("error","Joint-space planning failed; aborting motion.")
+                return False
+
+            self.log_with_time("info","Joint-space motion planned and executed successfully.")
+            return True
+
+
+
+    def MoveArm_old(self, position, quat_xyzw):
         """Plans and executes a joint-space move to the target pose, subdividing as needed to avoid planning failures."""
         time.sleep(0.5)  # Allow time for arm/controller to become ready
 
@@ -425,7 +528,7 @@ class MoveAR(Node):
         """Plans and executes a joint-space move to the target pose, via an automatically computed via‐point."""
         time.sleep(0.5)  # Allow time for arm/controller to become ready
 
-        self.log_with_time('info' ,"Starting joint-space motion...")
+        # self.log_with_time('info' ,"Starting joint-space motion...")
 
         # build the final target pose
         target_pose = PoseStamped()
@@ -531,10 +634,10 @@ class MoveAR(Node):
 
 
 def main():
-    # debugpy.listen(("0.0.0.0", 5678))
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
-    # print("debugger attached...")
+    debugpy.listen(("0.0.0.0", 5678))
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
+    print("debugger attached...")
 
     
     rclpy.init()
@@ -571,4 +674,6 @@ def main():
 
 
 if __name__ == "__main__":
+
+
     main()
