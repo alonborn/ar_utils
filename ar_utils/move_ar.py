@@ -2,6 +2,7 @@
 """
 A script to follow an aruco marker with a robot arm using PyMoveit2.
 """
+import math
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -10,8 +11,6 @@ from rclpy.time import Time
 from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
 from geometry_msgs.msg import Pose 
 from geometry_msgs.msg import Point 
-# from moveit_commander.action import MoveGroupAction, MoveGroupGoal
-from moveit_msgs.action import MoveGroup
 import threading
 import sys
 import tf2_ros
@@ -20,54 +19,42 @@ from typing import Optional
 import os
 import datetime
 
-from geometry_msgs.msg import Pose,Vector3
-#from tf2_geometry_msgs import do_transform_pose
+from geometry_msgs.msg import Pose
+import tf_transformations
 sys.path.insert(0, '/home/alon/ros_ws/src/pymoveit2')
 
 from pymoveit2 import MoveIt2
 import pymoveit2
 
-
-
 import logging
 import debugpy
-import atexit
 import time
 from pymoveit2.moveit2 import init_execute_trajectory_goal
-
-
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Pose
-from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import MotionPlanRequest, Constraints, PositionConstraint, OrientationConstraint, WorkspaceParameters
-from shape_msgs.msg import SolidPrimitive
-from builtin_interfaces.msg import Duration
-from rclpy.action import ActionClient
-from std_msgs.msg import Header
-from trajectory_msgs.msg import JointTrajectory
 import threading
-
 import cProfile
 import pstats
-
-
-#view end effector position
-#ros2 run tf2_ros tf2_echo base_link ee_link
-
 import cProfile
 import pstats
-from io import StringIO
-import os
-
 import cProfile
 import pstats
 import functools
 import datetime
 import os
 from sensor_msgs.msg import JointState
-
+from moveit_msgs.msg import CollisionObject
+from shape_msgs.msg import SolidPrimitive
+from geometry_msgs.msg import Pose
+from my_robot_interfaces.srv import SetRotatedForbiddenBox
+from moveit_msgs.msg import CollisionObject, PlanningScene
+from shape_msgs.msg import SolidPrimitive
+from geometry_msgs.msg import Pose as GeoPose
+from moveit_msgs.srv import ApplyPlanningScene
+import numpy as np
 
 def profile_this(func):
     @functools.wraps(func)  # <-- preserves original function name/signature for profiler
@@ -87,10 +74,6 @@ def profile_this(func):
             print(f"[Profiler] {func.__name__} total time: {stats.total_tt:.4f}s")
     return wrapper
 
-
-
-
-        
 class MoveAR(Node):
 
     def __init__(self):
@@ -122,10 +105,23 @@ class MoveAR(Node):
             callback_group=self.shared_cb_group
         )
         
+        self.srv_rotated_forbidden = self.create_service(
+            SetRotatedForbiddenBox,
+            "set_rotated_forbidden_box",
+            self.handle_set_rotated_forbidden_box,
+            callback_group=self.shared_cb_group
+        )
+
+        # --- Planning scene client ---
+        self.scene_client = self.create_client(
+            ApplyPlanningScene,
+            '/apply_planning_scene'
+        )
+
+        self.current_board_object_id = None
+
+
         self.log_with_time('info' ,"\033[92mService 'ar_move_to' is ready to receive Pose messages.\033[0m")
-
-        
-
 
         self.arm_joint_names = [
             "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
@@ -162,6 +158,141 @@ class MoveAR(Node):
         self.last_timer_time = time.time()
         self._move_done_event = threading.Event()
         self._move_in_progress = False
+    def _wait_for_scene_service(self):
+        if not self.scene_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error("❌ apply_planning_scene service not available!")
+            return False
+        return True
+
+    def _remove_old_board_object(self):
+        if self.current_board_object_id is None:
+            return
+
+        co = CollisionObject()
+        co.id = self.current_board_object_id
+        co.header.frame_id = "base_link"
+        co.operation = CollisionObject.REMOVE
+
+        ps = PlanningScene()
+        ps.is_diff = True
+        ps.world.collision_objects.append(co)
+
+        req = ApplyPlanningScene.Request(scene=ps)
+        self.scene_client.call_async(req)
+
+        self.get_logger().info(f"🗑️ Removed old board collision: {self.current_board_object_id}")
+        self.current_board_object_id = None
+
+    def handle_set_rotated_forbidden_box(self, req, res):
+        """
+        Service callback: update the board collision box using p1, p2, height, depth.
+        """
+
+        p1 = (req.p1_x, req.p1_y)
+        p2 = (req.p2_x, req.p2_y)
+
+        try:
+            self.update_rotated_board_collision(
+                p1=p1,
+                p2=p2,
+                height=req.height,
+                depth=req.depth
+            )
+            res.success = True
+            res.message = "Updated rotated forbidden box."
+        except Exception as e:
+            res.success = False
+            res.message = f"Failed: {e}"
+            self.get_logger().error(res.message)
+
+        return res
+
+
+
+    def handle_set_rotated_board_box(self, request, response):
+        """
+        Service callback to set/update the rotated board collision box.
+        """
+
+        p1 = (request.p1_x, request.p1_y)
+        p2 = (request.p2_x, request.p2_y)
+        height = request.height
+        depth = request.depth
+
+        try:
+            self.update_rotated_board_collision(p1, p2, height, depth)
+            response.success = True
+            response.message = "Rotated board collision box updated."
+        except Exception as e:
+            self.get_logger().error(f"Failed to update board collision: {e}")
+            response.success = False
+            response.message = f"Error: {e}"
+
+        return response
+
+
+    def update_rotated_board_collision(self, p1, p2, height, depth):
+        """
+        Creates/updates a rotated collision box for the board.
+        p1 and p2 define the XY span.
+        height defines Z size.
+        depth defines thickness of the box.
+        """
+        if not self._wait_for_scene_service():
+            return
+
+        # remove previous
+        self._remove_old_board_object()
+
+        x1, y1 = p1
+        x2, y2 = p2
+
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.sqrt(dx*dx + dy*dy)
+
+        yaw = math.atan2(dy, dx)
+
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        cz = height / 2.0   # assumes bottom of board at Z=0
+
+        # box primitive
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [length, depth, height]
+
+        q = tf_transformations.quaternion_from_euler(0, 0, yaw)
+
+        pose = GeoPose()
+        pose.position.x = cx
+        pose.position.y = cy
+        pose.position.z = cz
+        pose.orientation.x = q[0]
+        pose.orientation.y = q[1]
+        pose.orientation.z = q[2]
+        pose.orientation.w = q[3]
+
+        co = CollisionObject()
+        co.header.frame_id = "base_link"
+        co.id = "forbidden_board_box"
+        co.operation = CollisionObject.ADD
+        co.primitives = [box]
+        co.primitive_poses = [pose]
+
+        ps = PlanningScene()
+        ps.is_diff = True
+        ps.world.collision_objects.append(co)
+
+        req = ApplyPlanningScene.Request(scene=ps)
+        self.scene_client.call_async(req)
+
+        self.current_board_object_id = co.id
+        self.get_logger().info(
+            f"Updated rotated board box: center=({cx:.3f},{cy:.3f},{cz:.3f}), "
+            f"yaw={math.degrees(yaw):.1f}°, L={length:.3f}, D={depth:.3f}, H={height:.3f}"
+        )
+
 
     def joint_state_callback(self, msg):
         self.moveit2.last_joint_state = msg
@@ -205,13 +336,9 @@ class MoveAR(Node):
 
     def handle_move_ar(self, request: MoveToPose.Request, response: MoveToPose.Response):
         """Callback for the 'ar_move_to' service: receives a pose, plans and executes the move, and responds."""
-        # self.log_with_time('info' ,f"Received move request: Position ({request.pose.position.x}, {request.pose.position.y}, {request.pose.position.z})")
-        # self.log_with_time('info' ,f"Orientation: ({request.pose.orientation.x}, {request.pose.orientation.y}, {request.pose.orientation.z}, {request.pose.orientation.w})")
 
         pose_to_move = request.pose
         cartesian = request.cartesian
-
-        # self.log_with_time('info' ,f"Moving to: {pose_to_move}")
 
         timeout = 230  # seconds
         start_time = time.time()
@@ -220,12 +347,10 @@ class MoveAR(Node):
         self.moveit2.set_is_executing(True)
 
         if cartesian:
-            # self.log_with_time('info' ,"Moving in Cartesian space")
             print("Moving in Cartesian space")
 
             planning_success = self.MoveArmCartesian(pose_to_move.position, pose_to_move.orientation)
         else:
-            # self.log_with_time('info' ,"Moving in joint space")
             print("Moving in joint space")
 
             planning_success = self.MoveArm(pose_to_move.position, pose_to_move.orientation)
@@ -249,90 +374,13 @@ class MoveAR(Node):
             # print("waiting for motion to complete2...")
             time.sleep(0.05)
 
-        # self.log_with_time('info' ,"Motion completed")
         response.success = self.moveit2.motion_suceeded
         response.message = "Motion completed" if self.moveit2.motion_suceeded else "Motion failed"
 
         # self.log_with_time('info' ,f"Move result: {response.success}, Message: {response.message}")
         return response
 
-
-    def MoveArmOld(self, position, quat_xyzw):
-        """Plans and executes a joint-space move to the target pose."""
-        time.sleep(0.5)  # Allow time for arm/controller to become ready
-
-        self.log_with_time('info' ,"Starting joint-space motion...")
-
-        pose_goal = PoseStamped()
-        pose_goal.header.frame_id = "base_link"
-        pose_goal.pose = Pose(position=position, orientation=quat_xyzw)
-
-        try:
-            success = self.moveit2.move_to_pose(
-                pose=pose_goal,
-                cartesian=False
-            )
-        except Exception as e:
-            self.log_with_time('error' ,f"Joint-space planning failed: {e}")
-            return False
-
-        if not success:
-            self.log_with_time('error' ,f"Joint-space planning failed; aborting motion. success: {success}")
-            return False
-
-        self.log_with_time('info' ,"Joint-space motion planned successfully, sucess:" + str(success))
-        return True
-
-    def _on_via_point_found(self, via_pose: Optional[PoseStamped]):
-        if via_pose is None:
-            self.log_with_time('warn' ,"No valid via-point found. Attempting direct move to goal.")
-            # Try direct move
-            # self.moveit2.move_to_pose_async(
-            #     pose=self.goal_pose,
-            #     callback=self._on_motion_done,
-            #     path_constraints=self._move_action_goal.request.path_constraints
-            #         if hasattr(self, "_move_action_goal") else None
-            # )
-            return
-
-        self.log_with_time('info' ,"Via-point found. Moving to via-point first.")
-
-        # First move to the via-point
-        # self.moveit2.move_to_pose_async(
-        #     pose=via_pose,
-        #     callback=self._on_via_reached
-        # )
-
-
-
-    def _on_start_pose_ready(self, future):
-        try:
-            poses = future.result()
-            start_pose = poses[0]  # assuming only one link requested
-            self.start_pose = start_pose
-            self.log_with_time('info' ,f"Got FK pose: {start_pose}")
-            
-            # Now continue with whatever needs this pose
-            self.find_via_point(
-                start=start_pose,
-                goal=self.goal_pose,
-                steps=20,
-                callback=self._on_via_point_found
-            )
-        except Exception as e:
-            self.log_with_time('error' ,f"Failed to get FK: {e}")
-
-
-
-    def get_start_pose_async(self):
-        future = self.moveit2.compute_fk_async(
-            joint_state=self.moveit2.joint_state,
-            fk_link_names=[self.moveit2.end_effector_name]
-        )
-        future.add_done_callback(self._on_start_pose_ready)
-
-
-    def _log_motion_to_file(self, motion_type, success, start_pose=None, via_pose=None, target_pose=None):
+    def _log_motion_to_file(self, motion_type, success, start_pose=None, target_pose=None):
         log_path = os.path.expanduser("~/arm_motion.log")
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
@@ -354,7 +402,7 @@ class MoveAR(Node):
             else:
                 return f"UnknownType({type(pose)})"
         
-        log_entry = f"[{now}] Motion: {motion_type}, Success: {success}, Start: {fmt(start_pose)}, Via: {fmt(via_pose)}, Target: {fmt(target_pose)}\n"
+        log_entry = f"[{now}] Motion: {motion_type}, Success: {success}, Start: {fmt(start_pose)},  Target: {fmt(target_pose)}\n"
         with open(log_path, "a") as f:
             f.write(log_entry)
 
@@ -389,7 +437,7 @@ class MoveAR(Node):
         )
 
     def MoveArm(self, position, quat_xyzw):
-            """Plans and executes a joint-space move to the target pose, via an automatically computed via‐point."""
+            """Plans and executes a joint-space move to the target pose"""
             # time.sleep(0.5)  # Allow time for arm/controller to become ready
 
             # self.log_with_time("info","Starting joint-space motion...")
@@ -398,32 +446,6 @@ class MoveAR(Node):
             target_pose = PoseStamped()
             target_pose.header.frame_id = "base_link"
             target_pose.pose = Pose(position=position, orientation=quat_xyzw)
-
-            # ← **NEW** compute an intermediate via‐point to avoid flips/singularities
-            via_pose = None
-            # try:
-            #     via_pose = self.moveit2.find_via_point(target_pose)
-            #     self.logger.info(f"Via-point computed: {via_pose.pose.position}")
-            # except Exception as e:
-            #     self.logger.warn(f"Via-point computation failed ({e}); will try direct move only.")
-            #     via_pose = None
-
-            # ← **NEW** if we got a via‐point, move there first
-            if via_pose is not None:
-                try:
-                    success = self.moveit2.move_to_pose(
-                        pose=via_pose,
-                        cartesian=False
-                    )
-                except Exception as e:
-                    self.log_with_time("error",f"Joint-space planning to via-point failed: {e}")
-                    return False
-
-                if not success:
-                    self.log_with_time("error",f"Failed to reach via-point; aborting motion.")
-                    return False
-
-                self.log_with_time("info","Reached via-point successfully; now moving to final target.")
 
             # now do the normal move to the final pose
             try:
@@ -461,18 +483,18 @@ class MoveAR(Node):
             )
         except Exception as e:
             self.log_with_time('error' ,f"Cartesian planning failed with exception: {e}")
-            self._log_motion_to_file("Cartesian", False, None, None, position)
+            self._log_motion_to_file("Cartesian", False, None, position)
 
             return False
 
         if not success:
             self.log_with_time('error' ,"Cartesian planning failed; aborting motion.")
-            self._log_motion_to_file("Cartesian", False, None, None, position)
+            self._log_motion_to_file("Cartesian", False, None, position)
 
             return False
 
         self.log_with_time('info' ,"Cartesian motion planned successfully")
-        self._log_motion_to_file("Cartesian", True, None, None, position)
+        self._log_motion_to_file("Cartesian", True, None, position)
 
         return True
 
