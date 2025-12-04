@@ -14,7 +14,7 @@ from geometry_msgs.msg import Point
 import threading
 import sys
 import tf2_ros
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped,Quaternion
 from typing import Optional
 import os
 import datetime
@@ -121,7 +121,7 @@ class MoveAR(Node):
         self.current_board_object_id = None
 
 
-        self.log_with_time('info' ,"\033[92mService 'ar_move_to' is ready to receive Pose messages.\033[0m")
+        self.log_with_time('info', "Service 'ar_move_to' is ready to receive Pose messages.")
 
         self.arm_joint_names = [
             "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
@@ -209,28 +209,6 @@ class MoveAR(Node):
 
 
 
-    def handle_set_rotated_board_box(self, request, response):
-        """
-        Service callback to set/update the rotated board collision box.
-        """
-
-        p1 = (request.p1_x, request.p1_y)
-        p2 = (request.p2_x, request.p2_y)
-        height = request.height
-        depth = request.depth
-
-        try:
-            self.update_rotated_board_collision(p1, p2, height, depth)
-            response.success = True
-            response.message = "Rotated board collision box updated."
-        except Exception as e:
-            self.get_logger().error(f"Failed to update board collision: {e}")
-            response.success = False
-            response.message = f"Error: {e}"
-
-        return response
-
-
     def update_rotated_board_collision(self, p1, p2, height, depth):
         """
         Creates/updates a rotated collision box for the board.
@@ -260,7 +238,7 @@ class MoveAR(Node):
         # box primitive
         box = SolidPrimitive()
         box.type = SolidPrimitive.BOX
-        box.dimensions = [length, depth, height]
+        box.dimensions = [float(length), float(depth), float(height)]
 
         q = tf_transformations.quaternion_from_euler(0, 0, yaw)
 
@@ -334,50 +312,87 @@ class MoveAR(Node):
         self.file_logger.info(f"Position: {x},{y},{z} | Rotation: {qx},{qy},{qz},{qw}")
         
 
+    def MoveArmWithViaPoints(self, via_points, final_position, final_quat):
+        """Execute ONE continuous Cartesian trajectory through all via points."""
+        return self.MoveArmCartesian(final_position, final_quat, waypoints=via_points)
+
+
+
     def handle_move_ar(self, request: MoveToPose.Request, response: MoveToPose.Response):
-        """Callback for the 'ar_move_to' service: receives a pose, plans and executes the move, and responds."""
+        """
+        Callback for the 'ar_move_to_pose' service:
+        - Supports optional via-points (geometry_msgs/Pose[])
+        - Moves through via-points (if any), then to final pose
+        - Supports both Cartesian and Joint planning modes
+        """
 
         pose_to_move = request.pose
         cartesian = request.cartesian
+        via_points = request.via_points  # <-- new field from updated .srv
 
         timeout = 230  # seconds
         start_time = time.time()
 
-        planning_success = False
         self.moveit2.set_is_executing(True)
+        planning_success = False
 
-        if cartesian:
-            print("Moving in Cartesian space")
+        # ---------------------------------------------------------
+        # CASE 1: There are via points
+        # ---------------------------------------------------------
+        if len(via_points) > 0:
+            self.log_with_time('info', f"Received {len(via_points)} via point(s). Planning through them...")
 
-            planning_success = self.MoveArmCartesian(pose_to_move.position, pose_to_move.orientation)
+            planning_success = self.MoveArmWithViaPoints(
+                via_points=via_points,
+                final_position=pose_to_move.position,
+                final_quat=pose_to_move.orientation,
+                # cartesian=cartesian
+            )
+
+        # ---------------------------------------------------------
+        # CASE 2: No via points - normal behavior
+        # ---------------------------------------------------------
         else:
-            print("Moving in joint space")
+            if cartesian:
+                print("Moving in Cartesian space")
+                planning_success = self.MoveArmCartesian(
+                    pose_to_move.position,
+                    pose_to_move.orientation
+                )
+            else:
+                print("Moving in joint space")
+                planning_success = self.MoveArm(
+                    pose_to_move.position,
+                    pose_to_move.orientation
+                )
 
-            planning_success = self.MoveArm(pose_to_move.position, pose_to_move.orientation)
-
+        # ---------------------------------------------------------
+        # If planning failed entirely
+        # ---------------------------------------------------------
         if not planning_success:
             response.success = False
             response.message = "Planning failed"
-            self.log_with_time('warn' ,"Planning failed; returning early without execution.")
+            self.log_with_time('warn', "Planning failed; returning early without execution.")
             return response
 
-        # If planning succeeded, wait for execution to complete
-        # self.log_with_time('info' ,"Waiting for motion to complete...")
+        # ---------------------------------------------------------
+        # Wait for execution to finish (same as before)
+        # ---------------------------------------------------------
         while self.moveit2.is_executing():
             elapsed = time.time() - start_time
-            # self.log_with_time('info' ,f"Still waiting for motion to complete... elapsed {elapsed:.1f}s")
             if elapsed > timeout:
                 response.success = False
                 response.message = "Timeout reached"
-                self.log_with_time('error' ,"Execution timeout reached; aborting motion.")
+                self.log_with_time('error', "Execution timeout reached; aborting motion.")
                 return response
-            # print("waiting for motion to complete2...")
             time.sleep(0.05)
 
+        # ---------------------------------------------------------
+        # Final Result
+        # ---------------------------------------------------------
         response.success = self.moveit2.motion_suceeded
         response.message = "Motion completed" if self.moveit2.motion_suceeded else "Motion failed"
 
-        # self.log_with_time('info' ,f"Move result: {response.success}, Message: {response.message}")
         return response
 
     def _log_motion_to_file(self, motion_type, success, start_pose=None, target_pose=None):
@@ -465,7 +480,108 @@ class MoveAR(Node):
             print("Joint-space motion planned and executed successfully.")
             return True
 
-    def MoveArmCartesian(self, position, quat_xyzw):
+
+    def _build_pose(self, position, quat):
+        """
+        Helper: create a Pose from:
+          - position: geometry_msgs.msg.Point OR (x, y, z)
+          - quat: geometry_msgs.msg.Quaternion OR (x, y, z, w)
+        """
+        pose = Pose()
+
+        # Position
+        if isinstance(position, Point):
+            pose.position = position
+        else:
+            # assume tuple/list
+            pose.position.x = position[0]
+            pose.position.y = position[1]
+            pose.position.z = position[2]
+
+        # Orientation
+        if isinstance(quat, Quaternion):
+            pose.orientation = quat
+        else:
+            pose.orientation.x = quat[0]
+            pose.orientation.y = quat[1]
+            pose.orientation.z = quat[2]
+            pose.orientation.w = quat[3]
+
+        return pose
+
+    def _normalize_waypoint(self, wp, default_orientation):
+        """
+        Helper: convert different waypoint formats into a Pose.
+
+        wp can be:
+          - Pose
+          - Point
+          - (x, y, z) tuple/list
+
+        default_orientation: Quaternion to use when wp has no orientation.
+        """
+        if isinstance(wp, Pose):
+            return wp
+
+        pose_wp = Pose()
+
+        if isinstance(wp, Point):
+            pose_wp.position = wp
+        else:
+            # assume tuple/list
+            pose_wp.position.x = wp[0]
+            pose_wp.position.y = wp[1]
+            pose_wp.position.z = wp[2]
+
+        pose_wp.orientation = default_orientation
+        return pose_wp
+    def MoveArmCartesian(self, final_position, final_quat, waypoints=None):
+        """
+        Move the arm to a target pose, optionally passing through via-points.
+
+        final_position: geometry_msgs.msg.Point OR (x, y, z)
+        final_quat: geometry_msgs.msg.Quaternion OR (x, y, z, w)
+        waypoints: list of Pose / Point / (x, y, z)
+        """
+
+        # Build final pose robustly
+        final_pose = self._build_pose(final_position, final_quat)
+
+        # ---- No via-points: simple move_to_pose ----
+        if not waypoints:
+            success = self.moveit2.move_to_pose(
+                pose=final_pose,
+                cartesian=False
+            )
+            if not success:
+                self.get_logger().error("MoveArmCartesian: failed to reach final pose.")
+            return success
+
+        # ---- With via-points: step through them ----
+        for idx, wp in enumerate(waypoints):
+            pose_wp = self._normalize_waypoint(wp, final_pose.orientation)
+
+            ok = self.moveit2.move_to_pose(
+                pose=pose_wp,
+                cartesian=False
+            )
+            if not ok:
+                self.get_logger().error(
+                    f"MoveArmCartesian: failed to reach via-point #{idx}."
+                )
+                return False
+
+        # Finally go to the target
+        success = self.moveit2.move_to_pose(
+            pose=final_pose,
+            cartesian=False
+        )
+        if not success:
+            self.get_logger().error("MoveArmCartesian: failed to reach final pose after via-points.")
+        return success
+
+
+    def MoveArmCartesianOld(self, position, quat_xyzw):
         """Plans and executes a Cartesian-space move to the target pose."""
         time.sleep(0.5)  # Allow time for arm/controller to become ready
 
@@ -504,7 +620,7 @@ def main():
     # print("Waiting for debugger to attach...")
     # debugpy.wait_for_client()  # Uncomment this if you want to pause execution until the debugger attaches
     # print("debugger attached...")
-
+    # print("🔥 THIS IS THE NEW CODE")
     
     rclpy.init()
     
